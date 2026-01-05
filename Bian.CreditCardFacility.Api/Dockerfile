@@ -1,29 +1,26 @@
-# Runtime
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+# runtime
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
-
-# OpenShift normalmente enruta por 8080
-ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
+EXPOSE 8081
 
-# Build
+# build
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-
 COPY ["Bian.CreditCardFacility.Api/Bian.CreditCardFacility.Api.csproj", "Bian.CreditCardFacility.Api/"]
 RUN dotnet restore "./Bian.CreditCardFacility.Api/Bian.CreditCardFacility.Api.csproj"
-
 COPY . .
 WORKDIR "/src/Bian.CreditCardFacility.Api"
-RUN dotnet publish "./Bian.CreditCardFacility.Api.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+RUN dotnet build "./Bian.CreditCardFacility.Api.csproj" -c %BUILD_CONFIGURATION% -o /app/build
 
-# Final image
-FROM base AS final
+FROM build AS publish
+ARG BUILD_CONFIGURATION=Release
+RUN dotnet publish "./Bian.CreditCardFacility.Api.csproj" -c %BUILD_CONFIGURATION% -o /app/publish /p:UseAppHost=false
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
-COPY --from=build /app/publish .
-
-# Permisos OpenShift: grupo 0 y g=u para que funcione con UID aleatorio
-RUN chgrp -R 0 /app && chmod -R g=u /app
-
+EXPOSE 8080
+EXPOSE 8081
+COPY --from=publish /app/publish .
 ENTRYPOINT ["dotnet", "Bian.CreditCardFacility.Api.dll"]
