@@ -1,26 +1,18 @@
-# runtime
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
-WORKDIR /app
-EXPOSE 8080
-EXPOSE 8081
-
-# build
+# Build
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-COPY ["Bian.CreditCardFacility.Api/Bian.CreditCardFacility.Api.csproj", "Bian.CreditCardFacility.Api/"]
-RUN dotnet restore "./Bian.CreditCardFacility.Api/Bian.CreditCardFacility.Api.csproj"
+
+# OJO: como el context-dir YA es Bian.CreditCardFacility.Api, el csproj está en la raíz
+COPY ["Bian.CreditCardFacility.Api.csproj", "./"]
+RUN dotnet restore "./Bian.CreditCardFacility.Api.csproj"
+
 COPY . .
-WORKDIR "/src/Bian.CreditCardFacility.Api"
-RUN dotnet build "./Bian.CreditCardFacility.Api.csproj" -c %BUILD_CONFIGURATION% -o /app/build
+RUN dotnet publish "./Bian.CreditCardFacility.Api.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
 
-FROM build AS publish
-ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "./Bian.CreditCardFacility.Api.csproj" -c %BUILD_CONFIGURATION% -o /app/publish /p:UseAppHost=false
-
+# Runtime
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
+COPY --from=build /app/publish .
 EXPOSE 8080
-EXPOSE 8081
-COPY --from=publish /app/publish .
 ENTRYPOINT ["dotnet", "Bian.CreditCardFacility.Api.dll"]
