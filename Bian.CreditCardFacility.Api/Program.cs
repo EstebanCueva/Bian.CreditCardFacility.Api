@@ -1,10 +1,19 @@
 using Microsoft.OpenApi.Models;
-using Bian.CreditCardFacility.Api;
 using Bian.CreditCardFacility.Api.Models;
+using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Swagger
+// ====== PROXY CONFIG (LOCAL) ======
+var proxyBaseUrl = builder.Configuration["Proxy:BaseUrl"] ?? "http://localhost:7002";
+
+builder.Services.AddHttpClient("Proxy", c =>
+{
+    c.BaseAddress = new Uri(proxyBaseUrl);
+    c.Timeout = TimeSpan.FromSeconds(10);
+});
+
+// ====== Swagger ======
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
@@ -12,15 +21,15 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "BIAN Credit Card Facility API",
         Version = "v1",
-        Description = "PoC happy path (hardcoded data) - aligned to updated contract"
+        Description = "PoC (fachada -> proxy -> legacy mock) - aligned to updated contract"
     });
 
+    // Fachada local
     c.AddServer(new OpenApiServer
     {
-        Url = "http://localhost:8080/api/bian/v1/"
+        Url = "http://localhost:7003/api/bian/v1/"
     });
 
-    // bearerAuth como en tu contrato
     c.AddSecurityDefinition("bearerAuth", new OpenApiSecurityScheme
     {
         Type = SecuritySchemeType.Http,
@@ -55,7 +64,8 @@ app.UseSwaggerUI(c =>
 
 var api = app.MapGroup("/api/bian/v1");
 
-api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, HttpContext http) =>
+api.MapGet("/credit-card/customer/{CustomerId}/retrieve",
+async (string CustomerId, HttpContext http, IHttpClientFactory httpClientFactory, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(CustomerId))
     {
@@ -70,11 +80,11 @@ api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, Ht
 
     var requiredHeaders = new[]
     {
-        "X-Correlation-ID",
-        "X-Channel-Id",
-        "X-Application-Id",
-        "X-Transaction-Id",
-        "X-Parent-Id"
+        "x-correlation-id",
+        "x-channel-id",
+        "x-application-id",
+        "x-transaction-id",
+        "x-parent-id"
     };
 
     var missing = requiredHeaders
@@ -92,19 +102,66 @@ api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, Ht
         });
     }
 
-    if (!Data.TryGetByCustomerId(CustomerId, out var data))
+    // ====== CALL PROXY ======
+    var client = httpClientFactory.CreateClient("Proxy");
+
+    var proxyRequest = new HttpRequestMessage(
+        HttpMethod.Get,
+        $"/api/proxy/v1/prometeus/credit-card/{CustomerId}"
+    );
+
+    // Reenviar headers obligatorios al proxy
+    foreach (var h in requiredHeaders)
+        proxyRequest.Headers.TryAddWithoutValidation(h, http.Request.Headers[h].ToString());
+
+    // Opcionales
+    if (!string.IsNullOrWhiteSpace(http.Request.Headers["x-app-version"]))
+        proxyRequest.Headers.TryAddWithoutValidation("x-app-version", http.Request.Headers["x-app-version"].ToString());
+
+    if (!string.IsNullOrWhiteSpace(http.Request.Headers["x-request-id"]))
+        proxyRequest.Headers.TryAddWithoutValidation("x-request-id", http.Request.Headers["x-request-id"].ToString());
+
+    HttpResponseMessage proxyResp;
+    try
     {
-        return Results.NotFound(new ErrorResponse
-        {
-            Code = "404",
-            Type = "Processing",
-            Message = $"CustomerId '{CustomerId}' not found",
-            Details = new List<string> { "No credit cards associated to the given customer id." }
-        });
+        proxyResp = await client.SendAsync(proxyRequest, ct);
+    }
+    catch (TaskCanceledException)
+    {
+        // Timeout / cancel
+        return Results.StatusCode(504);
+    }
+    catch
+    {
+        // Proxy unreachable / network error
+        return Results.StatusCode(502);
     }
 
-    // 4) Total-Count header (contrato)
-    http.Response.Headers["Total-Count"] = data.CreditCardFacilities.Count.ToString();
+    // Si proxy devolvió error, lo propagamos
+    if (!proxyResp.IsSuccessStatusCode)
+    {
+        var errBody = await proxyResp.Content.ReadAsStringAsync(ct);
+        return Results.Content(errBody, "application/json", Encoding.UTF8, (int)proxyResp.StatusCode);
+    }
+
+    RetrieveCreditCardFacilitiesByCustomer? data;
+    try
+    {
+        data = await proxyResp.Content.ReadFromJsonAsync<RetrieveCreditCardFacilitiesByCustomer>(cancellationToken: ct);
+    }
+    catch
+    {
+        return Results.Problem("Invalid JSON from proxy", statusCode: 502);
+    }
+
+    if (data is null)
+        return Results.Problem("Empty response from proxy", statusCode: 502);
+
+    // Total-Count: preferir header del proxy; si no viene, calcular
+    if (proxyResp.Headers.TryGetValues("Total-Count", out var totalCountValues))
+        http.Response.Headers["Total-Count"] = totalCountValues.FirstOrDefault() ?? data.CreditCardFacilities.Count.ToString();
+    else
+        http.Response.Headers["Total-Count"] = data.CreditCardFacilities.Count.ToString();
 
     return Results.Ok(data);
 })
@@ -120,7 +177,6 @@ api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, Ht
 .Produces<ErrorResponse>(StatusCodes.Status500InternalServerError)
 .WithOpenApi(op =>
 {
-    // Headers (required)
     op.Parameters.Add(new OpenApiParameter
     {
         Name = "X-Correlation-ID",
@@ -162,7 +218,6 @@ api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, Ht
         Description = "Identifier for the parent transaction"
     });
 
-    // Headers (optional)
     op.Parameters.Add(new OpenApiParameter
     {
         Name = "X-App-Version",
@@ -180,7 +235,6 @@ api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, Ht
         Description = "Unique identifier for the request"
     });
 
-    // Response header Total-Count
     if (op.Responses.TryGetValue("200", out var r200))
     {
         r200.Headers ??= new Dictionary<string, OpenApiHeader>();
@@ -191,7 +245,6 @@ api.MapGet("/credit-card/Customer/{CustomerId}/retrieve", (string CustomerId, Ht
         };
     }
 
-    // Security for operation (bearerAuth + {})
     op.Security ??= new List<OpenApiSecurityRequirement>();
     op.Security.Add(new OpenApiSecurityRequirement
     {
