@@ -4,7 +4,6 @@ using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ====== PROXY CONFIG (LOCAL) ======
 var proxyBaseUrl = builder.Configuration["Proxy:BaseUrl"] ?? "http://localhost:7002";
 
 builder.Services.AddHttpClient("Proxy", c =>
@@ -13,7 +12,6 @@ builder.Services.AddHttpClient("Proxy", c =>
     c.Timeout = TimeSpan.FromSeconds(10);
 });
 
-// ====== Swagger ======
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
@@ -21,10 +19,9 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "BIAN Credit Card Facility API",
         Version = "v1",
-        Description = "PoC (fachada -> proxy -> legacy mock) - aligned to updated contract"
+        Description = "PoC (fachada -> proxy -> legacy) - aligned to updated contract"
     });
 
-    // Fachada local
     c.AddServer(new OpenApiServer
     {
         Url = "http://localhost:7003/api/bian/v1/"
@@ -102,24 +99,15 @@ async (string CustomerId, HttpContext http, IHttpClientFactory httpClientFactory
         });
     }
 
-    // ====== CALL PROXY ======
     var client = httpClientFactory.CreateClient("Proxy");
 
     var proxyRequest = new HttpRequestMessage(
         HttpMethod.Get,
-        $"/api/proxy/v1/prometeus/credit-card/{CustomerId}"
+        "/api/proxy/v1/legacy-service/credit-card"
     );
 
-    // Reenviar headers obligatorios al proxy
-    foreach (var h in requiredHeaders)
-        proxyRequest.Headers.TryAddWithoutValidation(h, http.Request.Headers[h].ToString());
-
-    // Opcionales
-    if (!string.IsNullOrWhiteSpace(http.Request.Headers["x-app-version"]))
-        proxyRequest.Headers.TryAddWithoutValidation("x-app-version", http.Request.Headers["x-app-version"].ToString());
-
-    if (!string.IsNullOrWhiteSpace(http.Request.Headers["x-request-id"]))
-        proxyRequest.Headers.TryAddWithoutValidation("x-request-id", http.Request.Headers["x-request-id"].ToString());
+    var canal = http.Request.Headers["x-channel-id"].ToString();
+    proxyRequest.Headers.TryAddWithoutValidation("Canal", canal);
 
     HttpResponseMessage proxyResp;
     try
@@ -128,16 +116,13 @@ async (string CustomerId, HttpContext http, IHttpClientFactory httpClientFactory
     }
     catch (TaskCanceledException)
     {
-        // Timeout / cancel
         return Results.StatusCode(504);
     }
     catch
     {
-        // Proxy unreachable / network error
         return Results.StatusCode(502);
     }
 
-    // Si proxy devolvió error, lo propagamos
     if (!proxyResp.IsSuccessStatusCode)
     {
         var errBody = await proxyResp.Content.ReadAsStringAsync(ct);
@@ -157,7 +142,6 @@ async (string CustomerId, HttpContext http, IHttpClientFactory httpClientFactory
     if (data is null)
         return Results.Problem("Empty response from proxy", statusCode: 502);
 
-    // Total-Count: preferir header del proxy; si no viene, calcular
     if (proxyResp.Headers.TryGetValues("Total-Count", out var totalCountValues))
         http.Response.Headers["Total-Count"] = totalCountValues.FirstOrDefault() ?? data.CreditCardFacilities.Count.ToString();
     else
